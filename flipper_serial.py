@@ -95,27 +95,33 @@ class FlipperSerial:
 
     def _open(self, port):
         """Open and configure the serial port."""
-        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+        try:
+            # Configure termios for 230400 baud, 8N1, raw mode
+            attrs = termios.tcgetattr(fd)
+            attrs[4] = termios.B230400  # ispeed
+            attrs[5] = termios.B230400  # ospeed
+            attrs[0] = 0                # iflag:  no input processing
+            attrs[1] = 0                # oflag:  no output processing
+            attrs[2] = (               # cflag:  8-bit, enable receiver, ignore modem
+                termios.CS8 | termios.CREAD | termios.CLOCAL
+            )
+            attrs[3] = 0                # lflag:  raw mode (no echo, no canonical)
+            attrs[6][termios.VMIN] = 1  # block until ≥1 byte
+            attrs[6][termios.VTIME] = 0  # no kernel timeout
 
-        # Configure termios for 230400 baud, 8N1, raw mode
-        attrs = termios.tcgetattr(self.fd)
-        attrs[4] = termios.B230400  # ispeed
-        attrs[5] = termios.B230400  # ospeed
-        attrs[0] = 0                # iflag:  no input processing
-        attrs[1] = 0                # oflag:  no output processing
-        attrs[2] = (               # cflag:  8-bit, enable receiver, ignore modem
-            termios.CS8 | termios.CREAD | termios.CLOCAL
-        )
-        attrs[3] = 0                # lflag:  raw mode (no echo, no canonical)
-        attrs[6][termios.VMIN] = 0  # non-blocking: return whatever is available
-        attrs[6][termios.VTIME] = READ_TIMEOUT_DS  # read timeout
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            termios.tcflush(fd, termios.TCIOFLUSH)
 
-        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
-        termios.tcflush(self.fd, termios.TCIOFLUSH)
+            self.fd = fd
 
-        # Drain the initial banner / any pending data by sending an empty
-        # command and reading until we see the prompt.
-        self._drain_banner()
+            # Drain the initial banner / any pending data by sending an empty
+            # command and reading until we see the prompt.
+            self._drain_banner()
+        except Exception:
+            os.close(fd)
+            self.fd = None
+            raise
 
     def _drain_banner(self):
         """Consume the Flipper's startup banner and any buffered data.
@@ -236,7 +242,7 @@ class FlipperSerial:
         for i, line in enumerate(lines):
             # The echo line may contain the prompt prefix
             cleaned = line.strip()
-            if cleaned.endswith(cmd_stripped) or cleaned == cmd_stripped:
+            if cleaned == cmd_stripped or cleaned == f">: {cmd_stripped}":
                 output_start = i + 1
                 break
 
@@ -342,6 +348,9 @@ class FlipperSerial:
             file_data = f.read()
 
         total_size = len(file_data)
+        if total_size == 0:
+            return  # Nothing to write for empty files
+
         offset = 0
         chunk_num = 0
 
@@ -409,6 +418,10 @@ class FlipperSerial:
                 raise RuntimeError(
                     f"Flipper storage error on chunk {chunk_num} of "
                     f"{remote_path}: {resp_text}"
+                )
+            if CLI_PROMPT_BYTES not in resp_data:
+                raise TimeoutError(
+                    f"Timed out waiting for chunk {chunk_num} acknowledgement"
                 )
 
             offset += chunk_size
