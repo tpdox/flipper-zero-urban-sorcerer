@@ -150,7 +150,10 @@ def collect_files_to_upload():
             continue
         for fpath in sorted(staging_sub.glob(pattern)):
             if fpath.is_file():
-                remote = f"{flipper_dest}/{fpath.name}"
+                # Sanitize filename: replace spaces with underscores
+                # (Flipper CLI tokenizes on spaces)
+                safe_name = fpath.name.replace(" ", "_")
+                remote = f"{flipper_dest}/{safe_name}"
                 uploads.append((fpath, remote))
 
     # Amiibo collection — limit to popular series subset
@@ -291,20 +294,42 @@ def upload_files(flipper, uploads, dry_run=False):
         print(f"  [{i:>4}/{total}] {local_path.name} -> {remote_path} ({size_str})", end="")
         sys.stdout.flush()
 
-        try:
-            start = time.monotonic()
-            flipper.storage_write(str(local_path), remote_path)
-            elapsed = time.monotonic() - start
-            print(f"  OK ({elapsed:.1f}s)")
-            success += 1
-            total_bytes += file_size
-        except (TimeoutError, OSError, RuntimeError) as e:
-            print(f"  FAIL: {e}")
+        ok = False
+        for attempt in range(2):  # retry once on failure
+            try:
+                if attempt > 0:
+                    # Recovery: flush, brief pause, send newline to reset CLI
+                    import termios as _termios
+                    _termios.tcflush(flipper.fd, _termios.TCIOFLUSH)
+                    time.sleep(0.5)
+                    os.write(flipper.fd, b"\r\n")
+                    time.sleep(0.3)
+                    _termios.tcflush(flipper.fd, _termios.TCIFLUSH)
+                    print(f" RETRY", end="")
+                    sys.stdout.flush()
+
+                start = time.monotonic()
+                flipper.storage_write(str(local_path), remote_path)
+                elapsed = time.monotonic() - start
+                print(f"  OK ({elapsed:.1f}s)")
+                success += 1
+                total_bytes += file_size
+                ok = True
+                break
+            except (TimeoutError, OSError, RuntimeError) as e:
+                if attempt == 0:
+                    last_err = e
+                    continue
+                print(f"  FAIL: {last_err}")
+                failed += 1
+            except KeyboardInterrupt:
+                print("\n\n[!] Upload interrupted by user.")
+                failed += (total - i)
+                return success, failed, total_bytes
+
+        if not ok and failed == 0:
+            # Shouldn't happen, but safety net
             failed += 1
-        except KeyboardInterrupt:
-            print("\n\n[!] Upload interrupted by user.")
-            failed += (total - i)
-            break
 
     return success, failed, total_bytes
 

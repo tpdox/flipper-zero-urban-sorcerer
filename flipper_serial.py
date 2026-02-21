@@ -20,6 +20,7 @@ Usage:
 
 import glob
 import os
+import re
 import select
 import time
 import termios
@@ -37,6 +38,15 @@ READ_TIMEOUT_DS = 20  # 2 seconds
 # Prompt that terminates every Flipper CLI response
 CLI_PROMPT = ">: "
 CLI_PROMPT_BYTES = b">: "
+
+# ANSI escape sequence pattern — Momentum firmware echoes with VT100
+# insert-mode toggles (\x1b[4h / \x1b[4l) and colour codes (\x1b[31m etc.)
+_ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def _strip_ansi(data: bytes) -> bytes:
+    """Remove ANSI escape sequences from raw bytes."""
+    return _ANSI_RE.sub(b'', data)
 
 
 def detect_flipper_port():
@@ -215,19 +225,18 @@ class FlipperSerial:
         if self.fd is None:
             raise OSError("Serial connection is closed")
 
-        # Flush any stale data in the input buffer
-        termios.tcflush(self.fd, termios.TCIFLUSH)
+        # Ensure we're at a clean >: prompt before sending
+        self._ensure_prompt()
 
         # Send the command
-        cmd_bytes = f"\r\n{cmd}\r\n".encode("utf-8")
-        os.write(self.fd, cmd_bytes)
+        os.write(self.fd, f"{cmd}\r\n".encode("utf-8"))
 
         # Small delay to let the Flipper process the command
         time.sleep(COMMAND_DELAY)
 
-        # Read the full response
+        # Read the full response, strip ANSI escapes from Momentum's VT100 echo
         raw = self._read_until_prompt(timeout=timeout)
-        response = raw.decode("utf-8", errors="replace")
+        response = _strip_ansi(raw).decode("utf-8", errors="replace")
 
         # Strip the echoed command. The Flipper echoes the command back with
         # a preceding prompt and carriage returns. We find the command in the
@@ -267,7 +276,8 @@ class FlipperSerial:
         Returns:
             str: The command response.
         """
-        response = self.send_command(f"storage mkdir {path}")
+        quoted = f'"{path}"' if " " in path else path
+        response = self.send_command(f"storage mkdir {quoted}")
         # "Storage error: already exists" is not a real error for mkdir
         return response
 
@@ -318,6 +328,19 @@ class FlipperSerial:
 
         return entries
 
+    def _ensure_prompt(self, timeout=3.0):
+        """Drain any pending output and ensure we're at a clean >: prompt.
+
+        Sends a bare newline, reads until the prompt appears, then discards
+        everything. After this returns, the Flipper CLI is ready for the
+        next command.
+        """
+        os.write(self.fd, b"\r\n")
+        try:
+            self._read_until_prompt(timeout=timeout)
+        except TimeoutError:
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+
     def storage_write(self, local_path, remote_path):
         """Write a local file to the Flipper's SD card using storage write_chunk.
 
@@ -351,6 +374,15 @@ class FlipperSerial:
         if total_size == 0:
             return  # Nothing to write for empty files
 
+        # Quote the remote path if it contains spaces
+        if " " in remote_path:
+            quoted_path = f'"{remote_path}"'
+        else:
+            quoted_path = remote_path
+
+        # Drain any pending output so the CLI is at a clean >: prompt
+        self._ensure_prompt()
+
         offset = 0
         chunk_num = 0
 
@@ -358,14 +390,20 @@ class FlipperSerial:
             chunk_size = min(WRITE_CHUNK_MAX, total_size - offset)
             chunk_data = file_data[offset : offset + chunk_size]
 
-            # Step 1: Send the write_chunk command
-            cmd = f"storage write_chunk {remote_path} {chunk_size}"
-            termios.tcflush(self.fd, termios.TCIFLUSH)
-            os.write(self.fd, f"\r\n{cmd}\r\n".encode("utf-8"))
+            # Step 1: Send the write_chunk command directly.
+            # We're guaranteed to be at a clean >: prompt (either from
+            # _ensure_prompt above or from Step 4 of the previous chunk).
+            # IMPORTANT: Use \r only (not \r\n). The Flipper CLI triggers on
+            # \r but leaves \n in its input buffer, where write_chunk would
+            # consume it as the first data byte, causing an off-by-one.
+            cmd = f"storage write_chunk {quoted_path} {chunk_size}"
+            os.write(self.fd, f"{cmd}\r".encode("utf-8"))
 
-            # Step 2: Wait for "Ready" response
+            # Step 2: Wait for "Ready" response.
+            # Momentum firmware echoes with VT100 ANSI escapes (\x1b[4h/4l)
+            # so we must strip them before checking for "Ready".
             ready_data = b""
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -377,27 +415,28 @@ class FlipperSerial:
                     got = os.read(self.fd, 4096)
                     if got:
                         ready_data += got
-                        if b"Ready" in ready_data:
+                        if b"Ready" in _strip_ansi(ready_data):
                             break
 
-            if b"Ready" not in ready_data:
-                # Check if there's an error instead
-                text = ready_data.decode("utf-8", errors="replace")
+            clean_ready = _strip_ansi(ready_data)
+            if b"Ready" not in clean_ready:
+                text = clean_ready.decode("utf-8", errors="replace")
                 if "Storage error" in text:
                     raise RuntimeError(
                         f"Flipper storage error writing {remote_path}: {text}"
                     )
                 raise TimeoutError(
                     f"Timed out waiting for 'Ready' from Flipper for chunk "
-                    f"{chunk_num} of {remote_path}. Got: {ready_data!r}"
+                    f"{chunk_num} of {remote_path}. Got: {text!r}"
                 )
 
             # Step 3: Send the raw chunk data
             os.write(self.fd, chunk_data)
 
-            # Step 4: Wait for OK / prompt / error
+            # Step 4: Wait for OK / prompt / error.
+            # After this, the CLI is back at >: ready for the next chunk.
             resp_data = b""
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -409,17 +448,17 @@ class FlipperSerial:
                     got = os.read(self.fd, 4096)
                     if got:
                         resp_data += got
-                        # The Flipper responds with OK then prompt, or an error
-                        if CLI_PROMPT_BYTES in resp_data:
+                        if CLI_PROMPT_BYTES in _strip_ansi(resp_data):
                             break
 
-            resp_text = resp_data.decode("utf-8", errors="replace")
+            clean_resp = _strip_ansi(resp_data)
+            resp_text = clean_resp.decode("utf-8", errors="replace")
             if "Storage error" in resp_text:
                 raise RuntimeError(
                     f"Flipper storage error on chunk {chunk_num} of "
                     f"{remote_path}: {resp_text}"
                 )
-            if CLI_PROMPT_BYTES not in resp_data:
+            if CLI_PROMPT_BYTES not in clean_resp:
                 raise TimeoutError(
                     f"Timed out waiting for chunk {chunk_num} acknowledgement"
                 )
