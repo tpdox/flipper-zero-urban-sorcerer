@@ -25,7 +25,7 @@ The deploy script downloads, curates, and pushes the following to your Flipper's
 ## Quick Start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/tpdox/flipper-zero-urban-sorcerer.git
 cd flipper
 
 # Flash Momentum firmware first (use Chrome/Edge, not qFlipper):
